@@ -19,478 +19,328 @@ import dash_bootstrap_components as dbc
 from flask_caching import Cache
 from dotenv import load_dotenv
 
-load_dotenv()
-
-# ---------- CONFIG ----------
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+# Finnhub API Key from environment
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 if not FINNHUB_API_KEY:
-    FINNHUB_API_KEY = "YOUR_API_KEY"  # replace or set .env
+    raise ValueError("Please set your Finnhub API key in the environment variable 'FINNHUB_API_KEY'")
 
-FINNHUB_CAL_URL = "https://finnhub.io/api/v1/calendar/earnings"
-FINNHUB_EARNINGS_FOR_SYMBOL = "https://finnhub.io/api/v1/stock/earnings"
-
-# caching config
-CACHE_CONFIG = {
-    "CACHE_TYPE": "SimpleCache",
-    "CACHE_DEFAULT_TIMEOUT": 60 * 10,  # 10 minutes
-}
-
-# ---------- HELPERS ----------
-def iso_date(d: date):
-    return d.strftime("%Y-%m-%d")
-
-def get_week_bounds(some_date: date = None):
-    today = some_date or date.today()
-    start = today - timedelta(days=today.weekday())  # Monday
-    end = start + timedelta(days=4)  # Friday
-    return start, end
-
-def request_finnhub(url, params=None):
-    params = params or {}
-    params["token"] = FINNHUB_API_KEY
-    resp = requests.get(url, params=params, timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Finnhub request failed ({resp.status_code}): {resp.text}")
-    return resp.json()
-
-@lru_cache(maxsize=64)
-def fetch_earnings_week(start_iso: str, end_iso: str):
-    data = request_finnhub(FINNHUB_CAL_URL, params={"from": start_iso, "to": end_iso})
-    results = data.get("earningsCalendar") or data.get("earnings") or data
-    if not results:
-        return pd.DataFrame()
-    df = pd.DataFrame(results)
-    copy_cols = {}
-    if "symbol" in df.columns:
-        copy_cols["symbol"] = "symbol"
-    elif "ticker" in df.columns:
-        copy_cols["symbol"] = "ticker"
-    if "date" in df.columns:
-        copy_cols["date"] = "date"
-    if "hour" in df.columns:
-        copy_cols["time"] = "hour"
-    if "time" in df.columns:
-        copy_cols["time"] = "time"
-    if copy_cols:
-        df = df.rename(columns={v: k for k, v in copy_cols.items()})
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-    if "time" in df.columns:
-        df["time"] = df["time"].fillna("TBA")
-    else:
-        df["time"] = "TBA"
-    if "symbol" not in df.columns and "ticker" in df.columns:
-        df = df.rename(columns={"ticker": "symbol"})
-    keep = [c for c in ["symbol", "date", "time", "company"] if c in df.columns]
-    return df[keep].drop_duplicates().reset_index(drop=True)
-
-@lru_cache(maxsize=128)
-def fetch_last_price(ticker: str):
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="5d", actions=False)
-        if hist.empty:
-            return None
-        return float(hist["Close"].dropna().iloc[-1])
-    except Exception:
-        return None
-
-@lru_cache(maxsize=128)
-def fetch_historical_prices(ticker: str, period: str = "5y"):
-    t = yf.Ticker(ticker)
-    df = t.history(period=period, actions=False).copy()
+def fetch_finnhub_earnings_for_day(day_name):
+    today = dt.date.today()
+    weekday_map = {
+        'Monday': 0,
+        'Tuesday': 1,
+        'Wednesday': 2,
+        'Thursday': 3,
+        'Friday': 4
+    }
+    
+    target_weekday = weekday_map.get(day_name, 0)
+    days_ahead = target_weekday - today.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    target_date = today + dt.timedelta(days=days_ahead)
+    from_date = target_date.strftime('%Y-%m-%d')
+    to_date = from_date  # single day earnings calendar
+    
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {
+        "from": from_date,
+        "to": to_date,
+        "token": FINNHUB_API_KEY
+    }
+    res = requests.get(url, params=params)
+    res.raise_for_status()
+    data = res.json()
+    
+    earnings = data.get("earningsCalendar") or data.get("earnings") or []
+    df = pd.DataFrame(earnings)
     if df.empty:
-        return pd.DataFrame()
-    df = df.reset_index()
-    df["Date"] = pd.to_datetime(df["Date"]).dt.date
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col not in df.columns:
-            df[col] = None
-    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
-@lru_cache(maxsize=128)
-def fetch_finnhub_earnings_for_symbol(ticker: str):
-    params = {"symbol": ticker}
-    try:
-        payload = request_finnhub(FINNHUB_EARNINGS_FOR_SYMBOL, params=params)
-        if not payload:
-            return []
-        return payload if isinstance(payload, list) else payload.get("earnings", []) or []
-    except Exception:
-        return []
-
-def compute_earnings_moves_from_hist(hist_df: pd.DataFrame, earnings_events: list):
-    if hist_df.empty or not earnings_events:
-        return pd.DataFrame()
-    hist = hist_df.set_index("Date")
-    results = []
-    for ev in earnings_events:
-        ev_date = None
-        if "date" in ev and ev["date"]:
-            try:
-                ev_date = pd.to_datetime(ev["date"]).date()
-            except Exception:
-                pass
-        elif "period" in ev and ev["period"]:
-            try:
-                ev_date = pd.to_datetime(ev["period"]).date()
-            except Exception:
-                pass
-        elif "datetime" in ev and ev["datetime"]:
-            try:
-                ev_date = pd.to_datetime(ev["datetime"]).date()
-            except Exception:
-                pass
-        if ev_date is None:
-            continue
-        ev_time = ev.get("time") or ev.get("hour") or ev.get("epsReportTime") or "TBA"
-        ev_time = ev_time.upper() if isinstance(ev_time, str) else "TBA"
+        return df
+    
+    # Rename to match your existing columns
+    df.rename(columns={
+        "symbol": "ticker",
+        "companyShortName": "company",
+        "date": "earningsday",
+        "hour": "earningstime"
+    }, inplace=True)
+    
+    # Fetch last price for each ticker using yfinance (slow for many tickers)
+    def get_last_price(ticker):
         try:
-            if ev_time.startswith("B"):
-                pre_date = prev_trading_date(ev_date, hist)
-                post_date = ev_date
+            hist = yf.Ticker(ticker).history(period='1d')
+            if not hist.empty:
+                return hist['Close'][-1]
             else:
-                pre_date = ev_date
-                post_date = next_trading_date(ev_date, hist)
-        except Exception:
-            continue
-        if pre_date not in hist.index or post_date not in hist.index:
-            continue
-        pre_close = hist.at[pre_date, "Close"]
-        post_open = hist.at[post_date, "Open"]
-        post_close = hist.at[post_date, "Close"]
-        post_high = hist.at[post_date, "High"]
-        post_low = hist.at[post_date, "Low"]
-        pre_vol = hist.at[pre_date, "Volume"] or 0
-        post_vol = hist.at[post_date, "Volume"] or 0
-        pct_open = safe_percent((post_open - pre_close), pre_close)
-        pct_close = safe_percent((post_close - pre_close), pre_close)
-        pct_intraday = safe_percent((post_close - post_open), pre_close)
-        pct_high = safe_percent((post_high - pre_close), pre_close)
-        pct_low = safe_percent((post_low - pre_close), pre_close)
-        avg_vol_window = avg_volume_before(pre_date, hist, days=5)
-        vol_spike = False
-        if avg_vol_window is not None and avg_vol_window > 0 and post_vol > 2 * avg_vol_window:
-            vol_spike = True
-        elif pre_vol and post_vol > 2 * pre_vol:
-            vol_spike = True
-        results.append({
-            "earnings_date": ev_date.isoformat(),
-            "report_time": ev_time,
-            "pre_date": pre_date.isoformat(),
-            "post_date": post_date.isoformat(),
-            "pre_close": float_or_none(pre_close),
-            "post_open": float_or_none(post_open),
-            "post_close": float_or_none(post_close),
-            "%move_at_open": pct_open,
-            "%move_at_close": pct_close,
-            "%intraday_move": pct_intraday,
-            "%highest_move": pct_high,
-            "%lowest_move": pct_low,
-            "pre_volume": int_or_none(pre_vol),
-            "post_volume": int_or_none(post_vol),
-            "volume_spike": vol_spike
-        })
-    return pd.DataFrame(results)
-
-def prev_trading_date(d: date, hist_indexed: pd.DataFrame):
-    idxs = [dt for dt in hist_indexed.index if dt < d]
-    if not idxs:
-        raise KeyError("no previous trading date")
-    return max(idxs)
-
-def next_trading_date(d: date, hist_indexed: pd.DataFrame):
-    idxs = [dt for dt in hist_indexed.index if dt > d]
-    if not idxs:
-        raise KeyError("no next trading date")
-    return min(idxs)
-
-def safe_percent(numerator, denominator):
-    try:
-        if denominator == 0 or denominator is None:
+                return None
+        except:
             return None
-        return round(numerator / denominator * 100, 2)
-    except Exception:
-        return None
+        
+    df['last price'] = df['ticker'].apply(get_last_price)
+    
+    keep_cols = ['ticker', 'company', 'earningstime', 'last price', 'earningsday']
+    df = df[keep_cols]
+    df.sort_values(by='last price', ascending=False, inplace=True)
+    
+    return df
 
-def float_or_none(x):
-    try:
-        return None if x is None else float(x)
-    except Exception:
-        return None
 
-def int_or_none(x):
-    try:
-        return None if x is None else int(x)
-    except Exception:
-        return None
+external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 
-def avg_volume_before(seed_date: date, hist_indexed: pd.DataFrame, days: int = 5):
-    prev_days = sorted([d for d in hist_indexed.index if d < seed_date], reverse=True)[:days]
-    if not prev_days:
-        return None
-    volumes = [hist_indexed.at[d, "Volume"] or 0 for d in prev_days]
-    return sum(volumes) / len(volumes)
-
-# ---------- DASH APP ----------
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+app = dash.Dash(suppress_callback_exceptions=True, external_stylesheets=external_stylesheets)
 server = app.server
-cache = Cache(app.server, config=CACHE_CONFIG)
 
-start, end = get_week_bounds()
-default_start_iso = iso_date(start)
-default_end_iso = iso_date(end)
+colors = {'background': '#FDFEFE',
+          'text': '#283747 '}
 
-controls = dbc.Card(
-    dbc.CardBody([
-        dbc.Row([
-            dbc.Col([
-                html.Label("Week Start"),
-                dcc.DatePickerSingle(id="week-start", date=default_start_iso)
-            ], md=3),
-            dbc.Col([
-                html.Label("Week End"),
-                dcc.DatePickerSingle(id="week-end", date=default_end_iso)
-            ], md=3),
-            dbc.Col([
-                html.Label("Min price (USD)"),
-                dcc.Input(id="min-price", type="number", value=1, min=0, step=0.01)
-            ], md=2),
-            dbc.Col([
-                html.Label("Min absolute % move (|%)"),
-                dcc.Input(id="min-pct", type="number", value=0, min=0, step=0.1)
-            ], md=2),
-            dbc.Col([
-                html.Br(),
-                dbc.Button("Load Week", id="load-week", color="primary")
-            ], md=2)
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    html.Div(id='page-content'),
+    html.Div(id='intermediate-value', style={'display': 'none'}),
+    html.Div(id='intermediate-value2', style={'display': 'none'})
+])
+
+home_page = html.Div(
+    style={'backgroundColor': colors['background']},
+    children=[
+        html.Div([
+            html.H4(style={'display': 'inline-block', 'color': colors['text']}, children='Upcoming Earnings - '),
+            html.Div(children='Select individual stock from the table, click "load previous Earnings data" button, and hit Earnings History button to get historical earning moves',
+                     style={"margin-left": "15px", 'display': 'inline-block', 'float': 'middle', 'color': colors['text']})
         ]),
-        html.Div(id="controls-note", style={"marginTop": "8px", "fontSize": "12px", "color": "#666"})
-    ]),
-    className="mb-3"
+
+        html.Div(id='selected-ticker', style={'display': 'inline-block'}),
+
+        dbc.Button(children='Load Previous Earnings data',
+                   id='load-button',
+                   outline=True, color="dark",
+                   n_clicks=0,
+                   style={"margin-bottom": "10px", "margin-left": "5px", 'display': 'inline-block'}),
+
+        html.Div(style={'display': 'inline-block', 'float': 'right'},
+                 children=[dcc.Link(dbc.Button(children='Earnings History',
+                                              id='output-button',
+                                              outline=True, color="dark"),
+                                    href='/earn-hist')]),
+
+        dcc.Tabs(id='testing_tabs', value='tab-1',
+                 children=[
+                     dcc.Tab(label='Monday', value='tab-1'),
+                     dcc.Tab(label='Tuesday', value='tab-2'),
+                     dcc.Tab(label='Wednesday', value='tab-3'),
+                     dcc.Tab(label='Thursday', value='tab-4'),
+                     dcc.Tab(label='Friday', value='tab-5'),
+                 ],
+                 colors={
+                     "border": "solid orange",
+                     "primary": "solid orange",
+                     "background": "grey"
+                 },
+                 style={
+                     'fontFamily': 'system-ui',
+                     'borderRadius': '15px',
+                     'overflow': 'hidden',
+                 }
+                 ),
+        html.Div(id='tabs-test-content')
+    ]
 )
 
-app.layout = dbc.Container([
-    dbc.Row(dbc.Col(html.H2("Earnings Moves Analyzer"), width=12)),
-    dbc.Row(dbc.Col(html.P("Visualize and analyze stock moves around earnings (Finnhub + yfinance)."), width=12)),
-    dbc.Row(dbc.Col(controls, width=12)),
-    dbc.Row([
-        dbc.Col(html.Div(id="earnings-table-container"), md=6),
-        dbc.Col(html.Div(id="ticker-summary"), md=6)
-    ]),
-    dbc.Row(dbc.Col(html.Div(id="chart-container"), width=12), className="mt-3"),
-    dbc.Row([
-        dbc.Col(dbc.Button("Download CSV (history)", id="download-csv", color="secondary"), md=2),
-        dbc.Col(html.Div(id="download-link"), md=10)
-    ], className="mt-2"),
-    dcc.Store(id="earnings-week-store"),
-    dcc.Store(id="selected-ticker-store"),
-    dcc.Store(id="history-data-store")
-], fluid=True)
-
-@app.callback(
-    Output("earnings-week-store", "data"),
-    Output("controls-note", "children"),
-    Input("load-week", "n_clicks"),
-    State("week-start", "date"),
-    State("week-end", "date"),
-    State("min-price", "value"),
-    prevent_initial_call=False
-)
-def load_week(n_clicks, week_start, week_end, min_price):
-    try:
-        if not week_start or not week_end:
-            return dash.no_update, "Please select a valid week start and end."
-        start_iso = week_start
-        end_iso = week_end
-        df = fetch_earnings_week(start_iso, end_iso)
-        if df.empty:
-            return [], f"No earnings found between {start_iso} and {end_iso}."
-        df = df.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
-        df["last_price"] = df["symbol"].apply(lambda s: fetch_last_price(s) or 0)
-        if min_price is not None:
-            df = df[df["last_price"] >= float(min_price)]
-        df = df.sort_values(by="last_price", ascending=False).reset_index(drop=True)
-        note = f"Loaded {len(df)} tickers. Data cached for 10 minutes."
-        return df.to_dict("records"), note
-    except Exception as e:
-        return [], f"Error loading week: {e}"
-
-@app.callback(
-    Output("earnings-table-container", "children"),
-    Input("earnings-week-store", "data")
-)
-def render_earnings_table(data):
-    if not data:
-        return html.Div("No earnings loaded. Pick a week and click 'Load Week'.")
-    df = pd.DataFrame(data)
-    table = dash_table.DataTable(
-        id="earnings-table",
-        columns=[
-            {"name": "Ticker", "id": "symbol"},
-            {"name": "Company", "id": "company"},
-            {"name": "Earnings Date", "id": "date", "type": "datetime"},
-            {"name": "Time", "id": "time"},
-            {"name": "Last Price", "id": "last_price", "type": "numeric", "format": {"specifier": ".2f"}},
-        ],
-        data=df.to_dict("records"),
+@app.callback(Output('tabs-test-content', 'children'),
+              [Input('testing_tabs', 'value')])
+def render_content(tab):
+    if tab == 'tab-1':
+        df = fetch_finnhub_earnings_for_day('Monday')
+    elif tab == 'tab-2':
+        df = fetch_finnhub_earnings_for_day('Tuesday')
+    elif tab == 'tab-3':
+        df = fetch_finnhub_earnings_for_day('Wednesday')
+    elif tab == 'tab-4':
+        df = fetch_finnhub_earnings_for_day('Thursday')
+    elif tab == 'tab-5':
+        df = fetch_finnhub_earnings_for_day('Friday')
+    else:
+        df = pd.DataFrame()
+    
+    if df.empty:
+        return html.Div("No earnings data found for this day.")
+    
+    return dash_table.DataTable(
+        id='table',
+        columns=[{"name": i, "id": i} for i in df.columns],
+        data=df.to_dict('records'),
         row_selectable="single",
         selected_rows=[],
-        style_cell={"textAlign": "left"},
-        page_size=12
+        style_cell={'textAlign': 'left'},
+        style_table={
+            'border': '1px solid orange',
+            'borderRadius': '15px',
+            'overflow': 'hidden',
+            'fontFamily': 'Sans-Serif',
+            'fontSize': '13px',
+            'overflowX': 'scroll'
+        }
     )
-    return html.Div([
-        html.H5("Upcoming earnings (week)"),
-        table
-    ])
 
-@app.callback(
-    Output("selected-ticker-store", "data"),
-    Input("earnings-table", "selected_rows"),
-    State("earnings-week-store", "data")
+@app.callback(Output('selected-ticker', 'children'),
+              [Input('table', 'selected_rows'),
+               Input('table', 'data')])
+def get_selected_row(selected_rows, data):
+    if not data:
+        return ''
+    df = pd.DataFrame(data)
+    if selected_rows and len(selected_rows) > 0:
+        stockstr = df.loc[selected_rows[0], 'ticker']
+        return stockstr
+    else:
+        return ''
+
+@app.callback(Output('intermediate-value2', 'children'),
+              [Input('load-button', 'n_clicks')],
+              [State('selected-ticker', 'children')])
+def update_output1(n_clicks, selticker):
+    if selticker and n_clicks > 0:
+        return selticker
+
+@app.callback(Output('intermediate-value', 'children'),
+              [Input('load-button', 'n_clicks')],
+              [State('selected-ticker', 'children')])
+def update_output(n_clicks, selticker):
+    if selticker and n_clicks > 0:
+        stock = selticker
+        stock_data = yf.Ticker(stock)
+        data = stock_data.history(period="5y", actions=False)
+        data = data.reset_index()
+
+        earnings_dates = si.get_earnings_history(stock)
+
+        date_outrange = []
+        ER_dates = []
+
+        pre_columns = ['pre' + str(x) for x in data.columns]
+        post_columns = ['post' + str(x) for x in data.columns]
+
+        earning_data_pre = pd.DataFrame()
+        earning_data_post = pd.DataFrame()
+
+        for i in range(len(earnings_dates)):
+            each_date = earnings_dates[i]['startdatetime'][:10]
+            if i < len(earnings_dates) - 1:
+                next_date = earnings_dates[i + 1]['startdatetime'][:10]
+
+            if dt.datetime.strptime(each_date, '%Y-%m-%d').date() < min(data['Date']) or dt.datetime.strptime(each_date,
+                                                                                                         '%Y-%m-%d').date() > max(
+                    data['Date']):
+                date_outrange.append(each_date)
+            else:
+                if ((dt.datetime.strptime(each_date, '%Y-%m-%d').date() - dt.datetime.strptime(next_date, '%Y-%m-%d').date()).days) > 7:
+                    ER_dates.append(each_date)
+
+        ER_dates = list(dict.fromkeys(ER_dates))
+
+        if earnings_dates[0]['startdatetimetype'] == 'AMC' or earnings_dates[0]['startdatetimetype'] == 'TNS' or int(
+                earnings_dates[0]['startdatetime'].split('T')[1][:2]) >= 16:
+
+            for dtes in ER_dates:
+                dtindex = data[data['Date'] == dtes].index
+                if dtindex.any() and dtindex[0] < len(data.index) - 1:
+                    earning_data_pre = earning_data_pre.append(data.iloc[dtindex])
+                    earning_data_post = earning_data_post.append(data.iloc[dtindex[0] + 1])
+
+            earning_data_post = earning_data_post.reset_index(drop=True)
+            earning_data_pre = earning_data_pre.reset_index(drop=True)
+            earning_data_pre.columns = pre_columns
+            earning_data_post.columns = post_columns
+
+        elif earnings_dates[0]['startdatetimetype'] == 'BMO' or int(earnings_dates[0]['startdatetime'].split('T')[1][:2]) < 16:
+
+            for dtes in ER_dates:
+                dtindex = data[data['Date'] == dtes].index
+                if dtindex.any() and dtindex[0] > 0:
+                    earning_data_pre = earning_data_pre.append(data.iloc[dtindex[0] - 1])
+                    earning_data_post = earning_data_post.append(data.iloc[dtindex])
+
+            earning_data_post = earning_data_post.reset_index(drop=True)
+            earning_data_pre = earning_data_pre.reset_index(drop=True)
+            earning_data_pre.columns = pre_columns
+            earning_data_post.columns = post_columns
+
+        earning_data_pre['pre_average'] = (earning_data_pre.preHigh + earning_data_pre.preLow) / 2
+        earning_data_post['post_average'] = (earning_data_post.postHigh + earning_data_post.postLow) / 2
+
+        final_data = pd.concat([earning_data_pre, earning_data_post], axis=1)
+
+        final_data['% move at open'] = ((final_data.postOpen - final_data.preClose) / final_data.preClose) * 100
+        final_data['% move at close'] = ((final_data.postClose - final_data.preClose) / final_data.preClose) * 100
+        final_data['% intraday move'] = ((final_data.postClose - final_data.postOpen) / final_data.preClose) * 100
+        final_data['% highest move'] = ((final_data.postHigh - final_data.preClose) / final_data.preClose) * 100
+        final_data['% lowest move'] = ((final_data.postLow - final_data.preClose) / final_data.preClose) * 100
+
+        final_data['postDate'] = pd.DatetimeIndex(final_data['postDate']).strftime("%b-%d-%Y")
+        final_data['preDate'] = pd.DatetimeIndex(final_data['preDate']).strftime("%b-%d-%Y")
+
+        del final_data['preVolume']
+        del final_data['postVolume']
+
+        final_data = final_data.round(0)
+
+        return final_data.to_json(orient='split')
+
+
+earnhist_layout = html.Div(
+    style={'backgroundColor': colors['background']},
+    children=[
+        html.Div([
+            html.H4(style={'display': 'inline-block', 'color': colors['text']},
+                    children='Earning Stats for previous quarters for '),
+            dcc.Loading(
+                id="loading-1",
+                type="circle",
+                children=html.H4(id='stock-ticker', style={"margin-left": "10px", 'display': 'inline-block', 'color': colors['text']}),
+                color="#AA6924")
+        ]),
+
+        html.Div(id='table_stats'),
+
+        dcc.Link('Go back to home', href='/')
+    ]
 )
-def select_ticker(selected_rows, week_data):
-    if not week_data or selected_rows is None or not selected_rows:
-        return None
-    ticker = pd.DataFrame(week_data).iloc[selected_rows[0]]["symbol"]
-    return {"ticker": ticker}
 
-@app.callback(
-    Output("history-data-store", "data"),
-    Output("ticker-summary", "children"),
-    Input("selected-ticker-store", "data"),
-    Input("min-pct", "value"),
-    prevent_initial_call=False
-)
-def load_history(selected_ticker_data, min_pct):
-    if not selected_ticker_data:
-        return dash.no_update, html.Div("Select a ticker from the table to load historical earnings moves.")
-    ticker = selected_ticker_data.get("ticker")
-    if not ticker:
-        return dash.no_update, html.Div("Invalid ticker selected.")
-    hist = fetch_historical_prices(ticker, period="5y")
-    if hist.empty:
-        return {}, html.Div(f"No price history found for {ticker}.")
-    evs = fetch_finnhub_earnings_for_symbol(ticker)
-    normalized_events = []
-    for e in evs:
-        ev_date = None
-        if isinstance(e, dict):
-            for k in ("date", "period", "startDate", "startdatetime"):
-                if k in e and e[k]:
-                    try:
-                        ev_date = pd.to_datetime(e[k]).date()
-                        break
-                    except Exception:
-                        pass
-            ev_time = e.get("time") or e.get("hour") or e.get("epsReportTime") or e.get("startdatetimetype") or e.get("reportTime") or "TBA"
-            normalized_events.append({"date": ev_date.isoformat() if ev_date else None, "time": ev_time, **e})
-    history_events = normalized_events
-    moves_df = compute_earnings_moves_from_hist(hist, history_events)
-    if moves_df.empty:
-        summary = html.Div(f"No earnings moves found for {ticker}.")
-        return {}, summary
-    if min_pct is not None and min_pct > 0:
-        moves_df = moves_df[moves_df["%move_at_close"].abs() >= float(min_pct)]
-    avg_move = moves_df["%move_at_close"].dropna()
-    avg_text = f"Avg % move at close: {round(avg_move.mean(),2)}%" if not avg_move.empty else "N/A"
-    spikes = moves_df[moves_df["volume_spike"] == True]
-    spike_text = f"Volume spikes: {len(spikes)}"
-    card = dbc.Card(dbc.CardBody([
-        html.H4(f"{ticker}", className="card-title"),
-        html.P(avg_text),
-        html.P(spike_text),
-        html.P(f"Events found: {len(moves_df)}"),
-        dbc.Button("Show chart & table", id="show-chart-btn", color="primary")
-    ]))
-    return moves_df.to_dict("records"), card
+@app.callback(Output('stock-ticker', 'children'), [Input('intermediate-value2', 'children')])
+def update_str(strtkr):
+    if strtkr:
+        time.sleep(2.5)
+        return strtkr
 
-@app.callback(
-    Output("chart-container", "children"),
-    Input("history-data-store", "data"),
-    State("selected-ticker-store", "data"),
-    prevent_initial_call=False
-)
-def render_chart(history_data, selected_ticker_data):
-    if not history_data or not selected_ticker_data:
-        return html.Div("Select a ticker and press 'Show chart & table'.")
-    df = pd.DataFrame(history_data)
-    ticker = selected_ticker_data.get("ticker")
-    price_hist = fetch_historical_prices(ticker, period="5y")
-    if price_hist.empty:
-        return html.Div("No price history available for plotting.")
-    price_hist_plot = price_hist.copy()
-    price_hist_plot["DateStr"] = pd.to_datetime(price_hist_plot["Date"]).astype(str)
-    cand = go.Candlestick(
-        x=price_hist_plot["DateStr"],
-        open=price_hist_plot["Open"],
-        high=price_hist_plot["High"],
-        low=price_hist_plot["Low"],
-        close=price_hist_plot["Close"],
-        name="Price"
-    )
-    markers = []
-    for idx, row in df.iterrows():
-        post_date = row.get("post_date") or row.get("postDate")
-        if not post_date:
-            continue
-        try:
-            yval = price_hist_plot.loc[price_hist_plot["Date"].astype(str) == post_date, "Close"].values
-            if len(yval) == 0:
-                continue
-            yval = float(yval[0])
-        except Exception:
-            continue
-        color = "green" if row.get("%move_at_close", 0) >= 0 else "red"
-        text = f"{row.get('earnings_date')}<br>{row.get('%move_at_close')}% ({row.get('report_time')})"
-        markers.append(go.Scatter(
-            x=[post_date],
-            y=[yval],
-            mode="markers+text",
-            marker=dict(color=color, size=10),
-            text=[f"{row.get('%move_at_close')}%"],
-            textposition="top center",
-            hoverinfo="text",
-            hovertext=text,
-            showlegend=False
-        ))
-    layout = go.Layout(
-        title=f"{ticker} price (candles) with earnings markers",
-        xaxis=dict(rangeslider=dict(visible=False)),
-        autosize=True,
-        height=600,
-    )
-    fig = go.Figure(data=[cand] + markers, layout=layout)
-    table = dash_table.DataTable(
-        id="history-table",
-        columns=[{"name": c, "id": c} for c in pd.DataFrame(history_data).columns],
-        data=history_data,
-        page_size=10,
-        style_cell={"textAlign": "center"}
-    )
-    return html.Div([
-        dcc.Graph(figure=fig, config={"displayModeBar": True}),
-        html.H5("Historical earnings moves"),
-        table
-    ])
+@app.callback(Output('table_stats', 'children'), [Input('intermediate-value', 'children')])
+def update_table(finaldata):
+    if finaldata:
+        dff = pd.read_json(finaldata, orient='split')
+        return dash_table.DataTable(
+            id='table_stat',
+            columns=[{"name": i, "id": i} for i in dff.columns],
+            data=dff.to_dict('records'),
+            style_cell={'textAlign': 'center'},
+            style_table={
+                'border': '1px solid orange',
+                'borderRadius': '15px',
+                'overflow': 'hidden',
+                'fontFamily': 'Sans-Serif',
+                'fontSize': '13px',
+                'overflowX': 'scroll'
+            }
+        )
+    else:
+        return html.Div([html.H4(children='No Stock Selected')])
 
-@app.callback(
-    Output("download-link", "children"),
-    Input("download-csv", "n_clicks"),
-    State("history-data-store", "data"),
-    State("selected-ticker-store", "data"),
-    prevent_initial_call=True
-)
-def generate_csv(n_clicks, history_data, selected_ticker_data):
-    if not history_data or not selected_ticker_data:
-        return html.Div("No data to download.")
-    df = pd.DataFrame(history_data)
-    ticker = selected_ticker_data.get("ticker")
-    csv_str = df.to_csv(index=False)
-    href = "data:text/csv;charset=utf-8," + requests.utils.requote_uri(csv_str)
-    filename = f"{ticker}_earnings_history.csv"
-    return html.A("Download CSV", href=href, download=filename, className="btn btn-outline-secondary")
+@app.callback(Output('page-content', 'children'),
+              [Input('url', 'pathname')])
+def display_page(pathname):
+    if pathname == '/earn-hist':
+        return earnhist_layout
+    else:
+        return home_page
 
-# ---------- RUN ----------
-if __name__ == "__main__":
-    app.run_server(debug=True, port=8050)
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
