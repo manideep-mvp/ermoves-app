@@ -14,8 +14,7 @@ import yfinance as yf
 import plotly.graph_objs as go
 
 import dash
-from dash import dcc, html, Input, Output, State
-import dash_table
+from dash import dcc, html, Input, Output, State, dash_table
 import dash_bootstrap_components as dbc
 from flask_caching import Cache
 from dotenv import load_dotenv
